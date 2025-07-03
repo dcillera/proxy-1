@@ -26,14 +26,14 @@ function init() {
 
 function get_envoy_sha() {
   local branch
-  branch="${BRANCH:-release/v1.34}"
+  branch="${BRANCH:-patch_arm64_assembly}"
 
-  SHA=$(git ls-remote https://github.com/envoyproxy/envoy-openssl.git "refs/heads/${branch}" | cut -f 1)
+  SHA=$(git ls-remote https://github.com/dcillera/envoy-openssl.git "refs/heads/${branch}" | cut -f 1)
 }
 
 function get_envoy_sha_256() {
   pushd "${WORKDIR}" >/dev/null
-  curl -sfLO "https://github.com/envoyproxy/envoy-openssl/archive/${SHA}.tar.gz"
+  curl -sfLO "https://github.com/dcillera/envoy-openssl/archive/${SHA}.tar.gz"
   SHA256=$(sha256sum "${SHA}.tar.gz" | awk '{print $1}')
   popd >/dev/null
 }
