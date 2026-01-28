@@ -54,6 +54,7 @@ function init(){
         "python3_12_ppc"
         "python3_12_s390x"
         "python3_12_aarch64"
+        "antlr4-cpp-runtime"
   )
 }
 
