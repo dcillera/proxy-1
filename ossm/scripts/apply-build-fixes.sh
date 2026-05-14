@@ -131,6 +131,128 @@ print("    Patching complete")
 EOFPYTHON
 fi
 
+# Fix 8: Use host Go instead of downloading for offline builds
+echo "  - Configuring WORKSPACE to use host Go..."
+WORKSPACE_FILE="WORKSPACE"
+if grep -q 'envoy_dependency_imports()$' "$WORKSPACE_FILE"; then
+    sed -i 's/envoy_dependency_imports()$/envoy_dependency_imports(go_version = "host")  # Use host Go for offline builds/' "$WORKSPACE_FILE"
+    echo "    WORKSPACE configured to use host Go"
+else
+    echo "    WORKSPACE already configured or pattern not found"
+fi
+
+# Fix 9: Ensure .bazelignore includes vendor directory for Go modules
+echo "  - Updating .bazelignore to ignore Go vendor directory..."
+BAZELIGNORE_FILE=".bazelignore"
+if ! grep -q '^vendor$' "$BAZELIGNORE_FILE" 2>/dev/null; then
+    echo "vendor" >> "$BAZELIGNORE_FILE"
+    echo "    Added 'vendor' to .bazelignore"
+else
+    echo "    .bazelignore already ignores vendor directory"
+fi
+
+# Fix 10: Configure WORKSPACE to use system LLVM (like OpenSSL)
+echo "  - Configuring WORKSPACE to use system LLVM..."
+WORKSPACE_FILE="WORKSPACE"
+
+# Check if llvm_toolchain_llvm local repository is already configured
+if ! grep -q 'name = "llvm_toolchain_llvm"' "$WORKSPACE_FILE"; then
+    # Find the line with openssl new_local_repository and add LLVM after it
+    # Insert after the openssl repository definition
+    sed -i '/^new_local_repository(/,/^)/ {
+        /^)/ a\
+\
+# Use LLVM from the system, not the one bundled in Envoy \
+# Avoids vendoring 9.6GB of LLVM toolchain\
+new_local_repository(\
+    name = "llvm_toolchain_llvm",\
+    path = "/usr",  # Use /usr so bin/clang resolves to /usr/bin/clang\
+    build_file = "//:llvm.BUILD",\
+)
+    }' "$WORKSPACE_FILE"
+    echo "    Added llvm_toolchain_llvm local repository to WORKSPACE"
+else
+    echo "    llvm_toolchain_llvm already configured in WORKSPACE"
+fi
+
+# Fix 11: Create symlinks in llvm_toolchain/bin to system LLVM tools
+# The vendored llvm_toolchain is just config/wrappers, but needs access to system binaries
+echo "  - Creating symlinks to system LLVM tools in llvm_toolchain/bin..."
+LLVM_TOOLCHAIN_BIN="ossm/vendor/llvm_toolchain/bin"
+
+if [ -d "$LLVM_TOOLCHAIN_BIN" ]; then
+    # Create symlinks to system LLVM tools (with -18 suffix from Fedora packages)
+    cd "$LLVM_TOOLCHAIN_BIN"
+
+    # Core compiler tools (required for CGO and general compilation)
+    ln -sf /usr/bin/clang-18 clang || true
+    ln -sf /usr/bin/clang++-18 clang++ || true
+
+    # Tools that may or may not exist - create if available
+    [ -f /usr/bin/clang-cpp-18 ] && ln -sf /usr/bin/clang-cpp-18 clang-cpp
+    [ -f /usr/bin/clang-format-18 ] && ln -sf /usr/bin/clang-format-18 clang-format
+    [ -f /usr/bin/clang-tidy-18 ] && ln -sf /usr/bin/clang-tidy-18 clang-tidy
+    [ -f /usr/bin/clangd-18 ] && ln -sf /usr/bin/clangd-18 clangd
+
+    # Required tools (should always exist from clang18-devel/llvm18-devel)
+    ln -sf /usr/bin/llvm-dwp-18 llvm-dwp || true
+    ln -sf /usr/bin/llvm-profdata-18 llvm-profdata || true
+    ln -sf /usr/bin/llvm-cov-18 llvm-cov || true
+    ln -sf /usr/bin/llvm-objcopy-18 llvm-objcopy || true
+    ln -sf /usr/bin/llvm-objdump-18 llvm-objdump || true
+
+    cd "$ROOT_DIR"
+    echo "    Created symlinks to system LLVM tools"
+else
+    echo "    Warning: llvm_toolchain/bin not found - may need to run update-deps.sh first"
+fi
+
+# Fix 12: Add /usr/lib/clang/18/include to cxx_builtin_include_directories
+# With BAZEL_USE_HOST_SYSROOT=True and -idirafter, headers are accessed via absolute paths
+# Bazel's strict include checking requires absolute paths in cxx_builtin_include_directories
+echo "  - Adding /usr/lib/clang/18/include to llvm_toolchain builtin include directories..."
+LLVM_TOOLCHAIN_BUILD="ossm/vendor/llvm_toolchain/BUILD.bazel"
+if [ -f "$LLVM_TOOLCHAIN_BUILD" ]; then
+    # Check if /usr/lib/clang/18/include is already added as absolute path
+    if ! grep -q '"/usr/lib/clang/18/include", "/usr/include"' "$LLVM_TOOLCHAIN_BUILD"; then
+        # Add /usr/lib/clang/18/include before /usr/include in all cxx_builtin_include_directories
+        sed -i 's|"/usr/include", "/usr/local/include"|"/usr/lib/clang/18/include", "/usr/include", "/usr/local/include"|g' "$LLVM_TOOLCHAIN_BUILD"
+        echo "    Added /usr/lib/clang/18/include to cxx_builtin_include_directories"
+    else
+        echo "    /usr/lib/clang/18/include already in cxx_builtin_include_directories"
+    fi
+else
+    echo "    Warning: llvm_toolchain/BUILD.bazel not found - may need to run update-deps.sh first"
+fi
+
+# Fix 13: Configure rules_foreign_cc to use preinstalled tools instead of bootstrapping
+# Bootstrapping GNU Make fails with custom compiler flags (-idirafter)
+# Use system make (/usr/bin/make) which is already installed in the container
+echo "  - Configuring rules_foreign_cc to use preinstalled tools..."
+DEPENDENCY_IMPORTS="ossm/vendor/envoy/bazel/dependency_imports.bzl"
+if [ -f "$DEPENDENCY_IMPORTS" ]; then
+    if ! grep -q "register_built_tools = False" "$DEPENDENCY_IMPORTS"; then
+        # Use perl for proper multiline replacement
+        perl -i -pe 's/rules_foreign_cc_dependencies\(\)/rules_foreign_cc_dependencies(\n        register_built_tools = False,\n        register_preinstalled_tools = True,\n    )/g' "$DEPENDENCY_IMPORTS"
+        echo "    Configured rules_foreign_cc to use preinstalled tools"
+    else
+        echo "    rules_foreign_cc already configured for preinstalled tools"
+    fi
+else
+    echo "    Warning: dependency_imports.bzl not found"
+fi
+
+# Fix 14: Create llvm_toolchain_llvm directory for Go CGO
+# Go's runtime/cgo looks for clang in toolchain_path_prefix which points to this vendored location
+echo "  - Creating llvm_toolchain_llvm directory for Go CGO..."
+LLVM_TOOLCHAIN_LLVM_BIN="ossm/vendor/llvm_toolchain_llvm/bin"
+mkdir -p "$LLVM_TOOLCHAIN_LLVM_BIN"
+cd "$LLVM_TOOLCHAIN_LLVM_BIN"
+ln -sf /usr/bin/clang-18 clang || true
+ln -sf /usr/bin/clang++-18 clang++ || true
+cd "$ROOT_DIR"
+echo "    Created llvm_toolchain_llvm directory with clang symlinks"
+
 echo ""
 echo "Build fixes applied successfully!"
 echo "You can now run: ./ossm/ci/pre-submit.sh"
